@@ -2,7 +2,9 @@ package otelkit
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -10,25 +12,29 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// HTTPMiddleware returns an HTTP middleware that automatically traces HTTP requests.
+// HTTPMiddleware returns an HTTP middleware that automatically traces, logs, and measures HTTP requests.
 // 
 // Parameters:
 //   - next: The next HTTP handler in the middleware chain
 //
 // Returns:
-//   - http.Handler: A wrapped handler that creates a span for each HTTP request
+//   - http.Handler: A wrapped handler that creates telemetry for each HTTP request
 //
 // The middleware automatically captures:
-//   - HTTP method (GET, POST, etc.)
-//   - Full request URL
-//   - Route path
-//   - User agent string
-//   - Remote client address
-//   - Response status code and status text
-//   - Request duration
+//   - HTTP traces with method, URL, status codes, and timing
+//   - Structured logs with request/response details and trace correlation
+//   - Metrics for request counts, duration histograms, and error rates
 //   - Error status for 4xx/5xx responses
+//
+// Telemetry includes:
+//   - Traces: HTTP method, URL, status code, duration, user agent, remote address
+//   - Logs: Request start/end, errors, structured context with trace correlation
+//   - Metrics: http_requests_total counter, http_request_duration_seconds histogram
 func (o *OTelKit) HTTPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		// Start tracing
 		ctx, span := o.StartSpan(r.Context(), r.Method+" "+r.URL.Path,
 			trace.WithAttributes(
 				attribute.String("http.method", r.Method),
@@ -40,21 +46,66 @@ func (o *OTelKit) HTTPMiddleware(next http.Handler) http.Handler {
 		)
 		defer span.End()
 
+		// Track active spans
+		o.IncrementActiveSpans(ctx)
+		defer o.DecrementActiveSpans(ctx)
+
+		// Log request start
+		o.LogInfo(ctx, "HTTP request started",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("user_agent", r.UserAgent()),
+			slog.String("remote_addr", r.RemoteAddr),
+		)
+
 		// Create a response writer wrapper to capture status code
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: 200}
 
 		// Execute the handler with the traced context
 		next.ServeHTTP(wrapped, r.WithContext(ctx))
 
-		// Add response attributes
+		// Calculate duration
+		duration := time.Since(start)
+		statusCode := strconv.Itoa(wrapped.statusCode)
+
+		// Add response attributes to span
 		span.SetAttributes(
 			attribute.Int("http.status_code", wrapped.statusCode),
 			attribute.String("http.status_text", http.StatusText(wrapped.statusCode)),
+			attribute.Float64("http.duration_ms", float64(duration.Nanoseconds())/1e6),
 		)
 
 		// Set span status based on HTTP status code
 		if wrapped.statusCode >= 400 {
 			span.SetStatus(codes.Error, http.StatusText(wrapped.statusCode))
+		}
+
+		// Record metrics
+		o.RecordHTTPMetrics(ctx, r.Method, statusCode, duration)
+
+		// Log request completion
+		logLevel := slog.LevelInfo
+		if wrapped.statusCode >= 500 {
+			logLevel = slog.LevelError
+		} else if wrapped.statusCode >= 400 {
+			logLevel = slog.LevelWarn
+		}
+
+		o.logger.LogAttrs(ctx, logLevel, "HTTP request completed",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status_code", wrapped.statusCode),
+			slog.String("status_text", http.StatusText(wrapped.statusCode)),
+			slog.Float64("duration_ms", float64(duration.Nanoseconds())/1e6),
+		)
+
+		// Log errors for 4xx/5xx responses
+		if wrapped.statusCode >= 400 {
+			o.LogError(ctx, "HTTP request failed",
+				nil, // No underlying error, just HTTP status
+				slog.Int("status_code", wrapped.statusCode),
+				slog.String("path", r.URL.Path),
+			)
 		}
 	})
 }
@@ -80,7 +131,7 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-// DatabaseOperation traces a database operation with standardized attributes.
+// DatabaseOperation traces and logs a database operation with standardized attributes.
 //
 // Parameters:
 //   - ctx: Context for the operation (will be enriched with span context)
@@ -95,13 +146,52 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 //   - db.operation: The operation type
 //   - db.table: The table name
 //   - db.type: Database type (defaults to "unknown", can be overridden in fn)
+//
+// Additionally provides structured logging with:
+//   - Operation start/completion logs with trace correlation
+//   - Error logging for failed operations
+//   - Performance timing information
 func (o *OTelKit) DatabaseOperation(ctx context.Context, operation, table string, fn func(ctx context.Context) error) error {
-	return o.TraceFunction(ctx, "db."+operation,
+	// Log operation start
+	o.LogDebug(ctx, "Database operation started",
+		slog.String("operation", operation),
+		slog.String("table", table),
+	)
+
+	start := time.Now()
+	
+	err := o.TraceFunction(ctx, "db."+operation,
 		fn,
 		attribute.String("db.operation", operation),
 		attribute.String("db.table", table),
 		attribute.String("db.type", "unknown"), // Can be overridden
 	)
+
+	duration := time.Since(start)
+
+	// Log operation completion
+	if err != nil {
+		o.LogError(ctx, "Database operation failed", err,
+			slog.String("operation", operation),
+			slog.String("table", table),
+			slog.Float64("duration_ms", float64(duration.Nanoseconds())/1e6),
+		)
+	} else {
+		o.LogDebug(ctx, "Database operation completed",
+			slog.String("operation", operation),
+			slog.String("table", table),
+			slog.Float64("duration_ms", float64(duration.Nanoseconds())/1e6),
+		)
+	}
+
+	// Record business metric
+	o.RecordMetric(ctx, "database_operation", 1,
+		attribute.String("db.operation", operation),
+		attribute.String("db.table", table),
+		attribute.Bool("success", err == nil),
+	)
+
+	return err
 }
 
 // CacheOperation traces a cache operation (get, set, delete, etc.).

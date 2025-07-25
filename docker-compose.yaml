@@ -1,6 +1,28 @@
 version: '3.8'
 
 services:
+  # OpenTelemetry Collector - Central telemetry pipeline
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./logs:/logs  # For file-based log collection
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8889:8889"   # Prometheus metrics endpoint
+      - "13133:13133" # Health check endpoint
+    depends_on:
+      - jaeger
+      - prometheus
+      - loki
+    networks:
+      - otel-net
+    environment:
+      - OTEL_LOG_LEVEL=debug
+
+  # Jaeger - Distributed tracing backend
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
@@ -9,23 +31,60 @@ services:
       - "14250:14250"   # Jaeger collector gRPC
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=memory
     networks:
       - otel-net
 
-  # OTLP Collector (alternative to Jaeger)
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
-    command: ["--config=/etc/otel-collector-config.yaml"]
+  # Prometheus - Metrics storage and querying
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
     volumes:
-      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "4317:4317"   # OTLP gRPC receiver
-      - "4318:4318"   # OTLP HTTP receiver
-      - "8889:8889"   # Prometheus metrics
+      - "9090:9090"
+    networks:
+      - otel-net
+
+  # Loki - Log aggregation system
+  loki:
+    image: grafana/loki:latest
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    networks:
+      - otel-net
+    environment:
+      - JAEGER_AGENT_HOST=jaeger
+      - JAEGER_AGENT_PORT=6831
+
+  # Grafana - Observability dashboard
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
+      - prometheus
+      - loki
       - jaeger
     networks:
       - otel-net
+
+volumes:
+  grafana-data:
 
 networks:
   otel-net:

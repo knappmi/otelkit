@@ -8,18 +8,53 @@ receivers:
 
 processors:
   batch:
+    timeout: 1s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+  memory_limiter:
+    limit_mib: 400
+    check_interval: 1s
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: development
+        action: upsert
 
 exporters:
-  jaeger:
+  # Export traces to Jaeger via OTLP
+  otlp/jaeger:
     endpoint: jaeger:14250
     tls:
       insecure: true
-  logging:
-    loglevel: debug
+
+  # Export metrics to Prometheus
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+  # Export logs to Loki
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+  # Console output for debugging
+  debug:
+    verbosity: detailed
 
 service:
   pipelines:
+    # Traces pipeline
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [jaeger, logging]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/jaeger, debug]
+    
+    # Metrics pipeline
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus, debug]
+    
+    # Logs pipeline
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [loki, debug]
